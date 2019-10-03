@@ -1,0 +1,101 @@
+# -*- coding: binary -*-
+
+require 'shellwords'
+
+module Msf
+module Sessions
+module MeterpreterOptions
+
+  def initialize(info = {})
+    super(info)
+
+    register_advanced_options(
+      [
+        OptBool.new('AutoLoadStdapi', [true, "Automatically load the Stdapi extension", true]),
+        OptBool.new('AutoVerifySession', [true, "Automatically verify and drop invalid sessions", true]),
+        OptInt.new('AutoVerifySessionTimeout', [false, "Timeout period to wait for session validation to occur, in seconds", 30]),
+        OptString.new('InitialAutoRunScript', [false, "An initial script to run on session creation (before AutoRunScript)", '']),
+        OptString.new('AutoRunScript', [false, "A script to run automatically on session creation.", '']),
+        OptBool.new('AutoSystemInfo', [true, "Automatically capture system information on initialization.", true]),
+        OptBool.new('EnableUnicodeEncoding', [true, "Automatically encode UTF-8 strings as hexadecimal", Rex::Compat.is_windows]),
+        OptPath.new('HandlerSSLCert', [false, "Path to a SSL certificate in unified PEM format, ignored for HTTP transports"]),
+        OptInt.new('SessionRetryTotal', [false, "Number of seconds try reconnecting for on network failure", Rex::Post::Meterpreter::ClientCore::TIMEOUT_RETRY_TOTAL]),
+        OptInt.new('SessionRetryWait', [false, "Number of seconds to wait between reconnect attempts", Rex::Post::Meterpreter::ClientCore::TIMEOUT_RETRY_WAIT]),
+        OptInt.new('SessionExpirationTimeout', [ false, 'The number of seconds before this session should be forcibly shut down', Rex::Post::Meterpreter::ClientCore::TIMEOUT_SESSION]),
+        OptInt.new('SessionCommunicationTimeout', [ false, 'The number of seconds of no activity before this session should be killed', Rex::Post::Meterpreter::ClientCore::TIMEOUT_COMMS])
+      ], self.class)
+  end
+
+  #
+  # Once a session is created, automatically load the stdapi extension if the
+  # advanced option is set to true.
+  #
+  def on_session(session)
+    init_session = Proc.new do
+      # Configure unicode encoding before loading stdapi
+      session.encode_unicode = datastore['EnableUnicodeEncoding']
+
+      session.init_ui(self.user_input, self.user_output)
+
+      print_good("negotiating tlv encryption")
+      session.tlv_enc_key = session.core.negotiate_tlv_encryption
+      print_good("negotiated tlv encryption")
+
+      if datastore['AutoVerifySession']
+        if !session.is_valid_session?(datastore['AutoVerifySessionTimeout'].to_i)
+          print_error("Meterpreter session #{session.sid} is not valid and will be closed")
+          # Terminate the session without cleanup if it did not validate
+          session.skip_cleanup = true
+          session.kill
+          return nil
+        end
+      end
+      print_good("negotiated tlv encryption")
+
+      # always make sure that the new session has a new guid if it's not already known
+      guid = session.session_guid
+      if guid == '00000000-0000-0000-0000-000000000000'
+        guid = SecureRandom.uuid
+        session.core.set_session_guid(guid)
+        session.session_guid = guid
+        # TODO: New stageless session, do some account in the DB so we can track it later.
+      else
+        # TODO: This session was either staged or previously known, and so we shold do some accounting here!
+      end
+
+      # Call registered on_session callbacks
+      super
+
+      if datastore['AutoLoadStdapi']
+        session.load_stdapi
+
+        if datastore['AutoSystemInfo']
+          session.load_session_info
+        end
+
+        # only load priv on native windows
+        if session.platform == 'windows' && [ARCH_X86, ARCH_X64].include?(session.arch)
+          session.load_priv rescue nil
+        end
+      end
+
+      if session.platform == 'android'
+        session.load_android
+      end
+
+      [ 'InitialAutoRunScript', 'AutoRunScript' ].each do |key|
+        unless datastore[key].empty?
+          args = Shellwords.shellwords( datastore[key] )
+          print_status("Session ID #{session.sid} (#{session.tunnel_to_s}) processing #{key} '#{datastore[key]}'")
+          session.execute_script(args.shift, *args)
+        end
+      end
+    end
+
+    # Defer the session initialization to the Session Manager scheduler
+    framework.sessions.schedule init_session
+  end
+end
+end
+end
+
